@@ -8,6 +8,8 @@ import json
 import hashlib
 import threading
 import multiprocessing
+import time
+import errno
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
@@ -32,8 +34,13 @@ class ProgressTracker:
                 with open(self.progress_file, 'r') as f:
                     data = json.load(f)
                     self.processed_files = set(data.get('processed_files', []))
+                    if self.processed_files:
+                        last_updated = data.get('last_updated', 'unknown')
+                        logging.info(f"Loaded progress: {len(self.processed_files)} files already processed (last updated: {last_updated})")
             except (json.JSONDecodeError, FileNotFoundError):
                 self.processed_files = set()
+        else:
+            self.processed_files = set()
 
     def save_progress(self):
         with open(self.progress_file, 'w') as f:
@@ -75,11 +82,78 @@ def setup_logging():
         ]
     )
 
+def is_network_error(exception):
+    """Detect if an exception is network-related (NFS, SMB, network drive issues)."""
+    # Check for common network error codes
+    network_errnos = {
+        errno.ESTALE,      # Stale file handle (NFS)
+        errno.ETIMEDOUT,   # Connection timed out
+        errno.ENETUNREACH, # Network is unreachable
+        errno.EHOSTUNREACH,# No route to host
+        errno.ECONNRESET,  # Connection reset
+        errno.EPIPE,       # Broken pipe
+        errno.EIO,         # I/O error (can indicate NFS issues)
+    }
+
+    # Check errno attribute
+    if hasattr(exception, 'errno') and exception.errno in network_errnos:
+        return True
+
+    # Check for common network error messages
+    error_str = str(exception).lower()
+    network_keywords = [
+        'stale file handle',
+        'connection',
+        'network',
+        'nfs',
+        'smb',
+        'timed out',
+        'unreachable',
+        'broken pipe',
+        'remote i/o error',
+        'no route to host'
+    ]
+
+    return any(keyword in error_str for keyword in network_keywords)
+
+def retry_on_network_error(func, *args, max_retries=3, initial_delay=1.0, backoff_factor=2.0, **kwargs):
+    """
+    Retry a function on network errors with exponential backoff.
+
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        backoff_factor: Multiplier for delay after each retry
+
+    Returns:
+        Function result or raises the last exception
+    """
+    delay = initial_delay
+    last_exception = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+
+            if attempt < max_retries and is_network_error(e):
+                logging.warning(f"Network error detected (attempt {attempt + 1}/{max_retries + 1}): {e}")
+                logging.info(f"Retrying in {delay:.1f} seconds...")
+                time.sleep(delay)
+                delay *= backoff_factor
+            else:
+                # Not a network error or out of retries
+                raise last_exception
+
+    raise last_exception
+
 def extract_single_file_from_zip(args):
     """Extract a single file from a zip archive - used for intra-zip parallelization."""
     zip_path_str, member_info, extract_dir_str = args
 
-    try:
+    def _do_extract():
         extract_dir = Path(extract_dir_str)
         target_path = extract_dir / member_info['filename']
         target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -90,9 +164,12 @@ def extract_single_file_from_zip(args):
                     while chunk := source.read(16384):
                         target.write(chunk)
 
+    try:
+        retry_on_network_error(_do_extract, max_retries=3)
         return True, member_info['filename'], None
     except Exception as e:
-        return False, member_info['filename'], str(e)
+        error_type = "Network error" if is_network_error(e) else "Error"
+        return False, member_info['filename'], f"{error_type}: {str(e)}"
 
 def extract_zip_worker(zip_path_str, intra_zip_workers=1):
     """Worker function for multiprocessing - extracts a single zip file with optional intra-zip parallelization."""
@@ -100,7 +177,8 @@ def extract_zip_worker(zip_path_str, intra_zip_workers=1):
     zip_name = zip_path.stem
     extract_dir = zip_path.parent / zip_name
 
-    try:
+    def _do_extraction():
+        """Inner function for retry logic."""
         extract_dir.mkdir(exist_ok=True)
 
         with zipfile.ZipFile(zip_path, 'r', allowZip64=True) as zip_ref:
@@ -124,7 +202,7 @@ def extract_zip_worker(zip_path_str, intra_zip_workers=1):
 
                 if failed_files:
                     error_msg = f"Failed to extract {len(failed_files)} files: {failed_files[:3]}"
-                    return False, str(zip_path), error_msg
+                    raise Exception(error_msg)
             else:
                 # Sequential extraction for smaller zips
                 for member in members:
@@ -137,7 +215,16 @@ def extract_zip_worker(zip_path_str, intra_zip_workers=1):
                             target.write(chunk)
                     source.close()
 
-        zip_path.unlink()
+    try:
+        # Retry extraction on network errors
+        retry_on_network_error(_do_extraction, max_retries=3)
+
+        # Only delete zip file after successful extraction
+        try:
+            retry_on_network_error(lambda: zip_path.unlink(), max_retries=2)
+        except Exception as e:
+            logging.warning(f"Could not delete {zip_path}: {e}. Extraction was successful.")
+
         return True, str(zip_path), None
 
     except zipfile.BadZipFile:
@@ -145,7 +232,8 @@ def extract_zip_worker(zip_path_str, intra_zip_workers=1):
     except PermissionError:
         return False, str(zip_path), "Permission denied"
     except Exception as e:
-        return False, str(zip_path), str(e)
+        error_prefix = "Network error" if is_network_error(e) else "Error"
+        return False, str(zip_path), f"{error_prefix}: {str(e)}"
 
 def extract_zip(zip_path, progress_tracker=None, progress_callback=None):
     """Extract a zip file to a folder with the same name as the zip file and delete the zip file."""
@@ -239,24 +327,36 @@ def scan_directory(directory, progress_tracker=None, progress_callback=None, sto
     logging.info(f"Scanning directory: {directory}")
 
     if progress_callback:
-        progress_callback("Scanning for zip files...")
+        progress_callback("Scanning for zip files...", 0)
 
     zip_files = list(directory.rglob("*.zip"))
+    total_found = len(zip_files)
 
     if not zip_files:
         logging.info("No zip files found")
         return 0, 0
 
     if progress_tracker:
+        original_count = len(zip_files)
         zip_files = [zf for zf in zip_files if not progress_tracker.is_processed(zf)]
+        skipped_count = original_count - len(zip_files)
+
+        if skipped_count > 0:
+            resume_msg = f"Resuming: {skipped_count} file(s) already processed, {len(zip_files)} remaining"
+            logging.info(resume_msg)
+            if progress_callback:
+                progress_callback(resume_msg, 0)
+
         if not zip_files:
             logging.info("All zip files already processed")
+            if progress_callback:
+                progress_callback("All files already processed!", 100)
             return 0, 0
 
     logging.info(f"Found {len(zip_files)} zip files to process")
 
     if progress_callback:
-        progress_callback("Analyzing zip files for optimal extraction...")
+        progress_callback(f"Analyzing {len(zip_files)} zip files for optimal extraction...", 0)
 
     file_analysis = analyze_zip_files(zip_files)
 
@@ -273,18 +373,33 @@ def _scan_directory_sequential(zip_files, progress_tracker, progress_callback, s
     """Sequential processing for small numbers of files or when multiprocessing is disabled."""
     success_count = 0
     processed_count = 0
+    total_files = len(zip_files)
 
     for i, zip_file in enumerate(zip_files):
         if stop_event and stop_event.is_set():
             logging.info("Operation cancelled by user")
             break
 
-        if progress_callback:
-            progress_callback(f"Processing {i+1}/{len(zip_files)}: {zip_file.name}")
+        percentage = int((i / total_files) * 100)
+        file_size_mb = zip_file.stat().st_size / (1024 * 1024)
 
-        if extract_zip(zip_file, progress_tracker, progress_callback):
-            success_count += 1
-        processed_count += 1
+        if progress_callback:
+            progress_callback(f"Processing {i+1}/{total_files}: {zip_file.name} ({file_size_mb:.1f} MB)", percentage)
+
+        try:
+            if extract_zip(zip_file, progress_tracker, None):
+                success_count += 1
+            processed_count += 1
+        except Exception as e:
+            processed_count += 1
+            if is_network_error(e):
+                logging.error(f"Network error processing {zip_file}: {e}")
+                # Immediately save progress on network errors
+                if progress_tracker:
+                    progress_tracker.batch_save_progress()
+                    logging.info("Progress saved due to network error")
+            else:
+                logging.error(f"Error processing {zip_file}: {e}")
 
         if progress_tracker and processed_count % 10 == 0:
             progress_tracker.batch_save_progress()
@@ -309,7 +424,7 @@ def _scan_directory_hybrid(large_zips, small_zips, progress_tracker, progress_ca
     logging.info(f"Using {max_workers} processes, {intra_zip_workers} threads per large zip")
 
     if progress_callback:
-        progress_callback(f"Starting hybrid extraction (large zips with {intra_zip_workers} threads each)...")
+        progress_callback(f"Starting hybrid extraction ({total_files} files, {len(large_zips)} large with {intra_zip_workers} threads each)...", 0)
 
     try:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -318,14 +433,14 @@ def _scan_directory_hybrid(large_zips, small_zips, progress_tracker, progress_ca
             # Submit large zips with intra-zip parallelization
             for zip_info in large_zips:
                 future = executor.submit(extract_zip_worker, str(zip_info['path']), intra_zip_workers)
-                futures.append((future, zip_info['path'], 'large'))
+                futures.append((future, zip_info['path'], zip_info['size_mb'], 'large'))
 
             # Submit small zips with single-threaded extraction
             for zip_info in small_zips:
                 future = executor.submit(extract_zip_worker, str(zip_info['path']), 1)
-                futures.append((future, zip_info['path'], 'small'))
+                futures.append((future, zip_info['path'], zip_info['size_mb'], 'small'))
 
-            for future, zip_path, zip_type in futures:
+            for future, zip_path, size_mb, zip_type in futures:
                 if stop_event and stop_event.is_set():
                     logging.info("Operation cancelled by user")
                     break
@@ -333,6 +448,7 @@ def _scan_directory_hybrid(large_zips, small_zips, progress_tracker, progress_ca
                 try:
                     success, extracted_path, error = future.result()
                     processed_count += 1
+                    percentage = int((processed_count / total_files) * 100)
 
                     if success:
                         success_count += 1
@@ -340,17 +456,32 @@ def _scan_directory_hybrid(large_zips, small_zips, progress_tracker, progress_ca
                         if progress_tracker:
                             progress_tracker.mark_processed(Path(extracted_path))
                     else:
-                        logging.error(f"Failed to extract {zip_type} zip {extracted_path}: {error}")
+                        error_lower = error.lower() if error else ""
+                        if "network error" in error_lower:
+                            logging.error(f"Network error extracting {zip_type} zip {extracted_path}: {error}")
+                            # Immediately save progress on network errors
+                            if progress_tracker:
+                                progress_tracker.batch_save_progress()
+                                logging.info("Progress saved due to network error")
+                        else:
+                            logging.error(f"Failed to extract {zip_type} zip {extracted_path}: {error}")
 
                     if progress_callback:
-                        progress_callback(f"Processed {processed_count}/{total_files} zips ({success_count} successful)")
+                        progress_callback(f"Processed {processed_count}/{total_files}: {zip_path.name} ({size_mb:.1f} MB) - {success_count} successful", percentage)
 
                     if progress_tracker and processed_count % batch_size == 0:
                         progress_tracker.batch_save_progress()
 
                 except Exception as e:
                     processed_count += 1
-                    logging.error(f"Error processing {zip_path}: {e}")
+                    if is_network_error(e):
+                        logging.error(f"Network error processing {zip_path}: {e}")
+                        # Immediately save progress on network errors
+                        if progress_tracker:
+                            progress_tracker.batch_save_progress()
+                            logging.info("Progress saved due to network error")
+                    else:
+                        logging.error(f"Error processing {zip_path}: {e}")
 
     except Exception as e:
         logging.error(f"Error in hybrid processing: {e}")
@@ -372,11 +503,12 @@ def _scan_directory_parallel(zip_files, progress_tracker, progress_callback, sto
     success_count = 0
     processed_count = 0
     batch_size = 10
+    total_files = len(zip_files)
 
     logging.info(f"Using {max_workers} worker processes")
 
     if progress_callback:
-        progress_callback(f"Starting parallel extraction with {max_workers} workers...")
+        progress_callback(f"Starting parallel extraction with {max_workers} workers ({total_files} files)...", 0)
 
     try:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -392,6 +524,7 @@ def _scan_directory_parallel(zip_files, progress_tracker, progress_callback, sto
                 try:
                     success, zip_path, error = future.result()
                     processed_count += 1
+                    percentage = int((processed_count / total_files) * 100)
 
                     if success:
                         success_count += 1
@@ -402,7 +535,7 @@ def _scan_directory_parallel(zip_files, progress_tracker, progress_callback, sto
                         logging.error(f"Failed to extract {zip_path}: {error}")
 
                     if progress_callback:
-                        progress_callback(f"Processed {processed_count}/{len(zip_files)} files ({success_count} successful)")
+                        progress_callback(f"Processed {processed_count}/{total_files}: {Path(zip_path).name} - {success_count} successful", percentage)
 
                     if progress_tracker and processed_count % batch_size == 0:
                         progress_tracker.batch_save_progress()
@@ -487,11 +620,11 @@ class ZipZapGUI:
         intra_zip_spinbox.grid(row=0, column=3, padx=5)
         
         ttk.Label(main_frame, text="Progress:").grid(row=4, column=0, sticky=tk.W, pady=(10, 5))
-        
+
         self.progress_var = tk.StringVar(value="Ready to start...")
         ttk.Label(main_frame, textvariable=self.progress_var).grid(row=5, column=0, sticky=tk.W)
 
-        self.progress_bar = ttk.Progressbar(main_frame, mode='indeterminate')
+        self.progress_bar = ttk.Progressbar(main_frame, mode='determinate', maximum=100)
         self.progress_bar.grid(row=6, column=0, sticky=(tk.W, tk.E), pady=5)
 
         ttk.Label(main_frame, text="Log:").grid(row=7, column=0, sticky=tk.W, pady=(10, 5))
@@ -524,18 +657,24 @@ class ZipZapGUI:
         if not directory:
             messagebox.showerror("Error", "Please select a directory")
             return
-        
+
         if not Path(directory).exists():
             messagebox.showerror("Error", "Directory does not exist")
             return
-        
+
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
         self.stop_event.clear()
-        
+
         self.log_text.delete(1.0, tk.END)
-        self.progress_bar.start()
-        
+        self.progress_bar['value'] = 0
+
+        # Show progress tracking status
+        if self.progress_tracker.processed_files:
+            self.update_progress(f"Progress tracking active: {len(self.progress_tracker.processed_files)} files already processed", 0)
+        else:
+            self.update_progress("Starting fresh extraction (progress tracking enabled)", 0)
+
         self.current_thread = threading.Thread(
             target=self.run_extraction,
             args=(directory,),
@@ -572,7 +711,13 @@ class ZipZapGUI:
 
             self.root.after(0, self.extraction_complete, success_count, processed_count)
         except Exception as e:
-            self.root.after(0, self.extraction_error, str(e))
+            # Always save progress on error
+            self.progress_tracker.batch_save_progress()
+            error_msg = str(e)
+            if is_network_error(e):
+                error_msg = f"Network error: {error_msg}\nProgress has been saved. You can safely restart and resume."
+                logging.error(f"Network error in extraction: {e}")
+            self.root.after(0, self.extraction_error, error_msg)
     
     def stop_extraction(self):
         self.stop_event.set()
@@ -582,25 +727,27 @@ class ZipZapGUI:
         self.progress_tracker.clear_progress()
         messagebox.showinfo("Progress Cleared", "Progress tracking has been reset")
     
-    def update_progress(self, message):
-        self.root.after(0, self._update_progress_ui, message)
-    
-    def _update_progress_ui(self, message):
+    def update_progress(self, message, percentage=None):
+        self.root.after(0, self._update_progress_ui, message, percentage)
+
+    def _update_progress_ui(self, message, percentage=None):
         self.progress_var.set(message)
         self.log_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} - {message}\n")
         self.log_text.see(tk.END)
+        if percentage is not None:
+            self.progress_bar['value'] = percentage
     
     def extraction_complete(self, success_count, processed_count):
-        self.progress_bar.stop()
+        self.progress_bar['value'] = 100
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
-        
+
         message = f"Extraction complete! Successfully processed {success_count}/{processed_count} zip files"
         self.progress_var.set(message)
         messagebox.showinfo("Complete", message)
     
     def extraction_error(self, error_message):
-        self.progress_bar.stop()
+        self.progress_bar['value'] = 0
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
 
@@ -615,7 +762,7 @@ class ZipZapGUI:
                 # Signal stop and wait for thread to finish
                 self.stop_event.set()
                 self.progress_var.set("Shutting down...")
-                self.progress_bar.stop()
+                self.progress_bar['value'] = 0
 
                 # Wait for thread to finish with timeout
                 logging.info("Waiting for extraction thread to finish...")
