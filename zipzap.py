@@ -430,9 +430,12 @@ class ZipZapGUI:
         self.progress_tracker = ProgressTracker()
         self.stop_event = threading.Event()
         self.current_thread = None
-        
+
         self.setup_ui()
         setup_logging()
+
+        # Register window close handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
     
     def setup_ui(self):
         main_frame = ttk.Frame(self.root, padding="10")
@@ -536,7 +539,7 @@ class ZipZapGUI:
         self.current_thread = threading.Thread(
             target=self.run_extraction,
             args=(directory,),
-            daemon=True
+            daemon=False
         )
         self.current_thread.start()
     
@@ -600,9 +603,36 @@ class ZipZapGUI:
         self.progress_bar.stop()
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
-        
+
         self.progress_var.set("Error occurred")
         messagebox.showerror("Error", f"An error occurred: {error_message}")
+
+    def on_closing(self):
+        """Handle window close event with proper cleanup."""
+        # If extraction is running, ask for confirmation
+        if self.current_thread and self.current_thread.is_alive():
+            if messagebox.askokcancel("Quit", "Extraction is running. Stop and quit?"):
+                # Signal stop and wait for thread to finish
+                self.stop_event.set()
+                self.progress_var.set("Shutting down...")
+                self.progress_bar.stop()
+
+                # Wait for thread to finish with timeout
+                logging.info("Waiting for extraction thread to finish...")
+                self.current_thread.join(timeout=5.0)
+
+                if self.current_thread.is_alive():
+                    logging.warning("Thread did not finish in time, forcing shutdown")
+                else:
+                    logging.info("Thread finished gracefully")
+
+                # Save any pending progress
+                self.progress_tracker.batch_save_progress()
+                self.root.destroy()
+        else:
+            # No extraction running, just close
+            self.progress_tracker.batch_save_progress()
+            self.root.destroy()
 
 def main():
     setup_logging()
